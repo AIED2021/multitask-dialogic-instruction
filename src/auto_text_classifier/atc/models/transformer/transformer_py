@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import copy
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+from atc.models.torch_base import TorchBase
+
+
+class TransformerNet(nn.Module):
+    def __init__(self, O_CONFIG):
+        super(TransformerNet, self).__init__()
+
+        self.embedding = nn.Embedding.from_pretrained(O_CONFIG["embed_pretrained"], freeze=(not O_CONFIG["update_embed"]))
+        self.postion_embedding = Positional_Encoding(O_CONFIG["embed_dim"], O_CONFIG["pad_size"], O_CONFIG["dropout"], O_CONFIG["device"])
+        self.encoder = Encoder(O_CONFIG["embed_dim"], O_CONFIG["head_num"], O_CONFIG["hidden_size"], O_CONFIG["dropout"])
+        self.encoders = nn.ModuleList([
+            copy.deepcopy(self.encoder)
+            # Encoder(config.n_model_dim, config.n_head_num, config.n_hidden_size, config.f_dropout)
+            for _ in range(O_CONFIG["encoder_num"])])
+
+        self.fc1 = nn.Linear(O_CONFIG["pad_size"] * O_CONFIG["embed_dim"], O_CONFIG["num_labels"])
+        self.softmax = nn.Softmax(dim=1)
+
+
+   
+        
+    def forward(self, x):
+        out = self.embedding(x)
+        out = self.postion_embedding(out)
+        for encoder in self.encoders:
+            out = encoder(out)
+        out = out.view(out.size(0), -1)
+        # out = torch.mean(out, 1)
+        out = self.fc1(out)
+
+        if len(out.shape) ==  1:
+            out = out.unsqueeze(0)
+
+        out = self.softmax(out)
+
+        return out
+
+class Encoder(nn.Module):
+    def __init__(self, dim_model, num_head, hidden, dropout):
+        super(Encoder, self).__init__()
+        self.attention = Multi_Head_Attention(dim_model, num_head, dropout)
+        self.feed_forward = Position_wise_Feed_Forward(dim_model, hidden, dropout)
+
+    def forward(self, x):
+        out = self.attention(x)
+        out = self.feed_forward(out)
+        return out
+
+
+class Positional_Encoding(nn.Module):
+    def __init__(self, embed, pad_size, dropout, device):
+        super(Positional_Encoding, self).__init__()
+        self.device = device
+        self.pe = torch.tensor([[pos / (10000.0 ** (i // 2 * 2.0 / embed)) for i in range(embed)] for pos in range(pad_size)])
+        self.pe[:, 0::2] = np.sin(self.pe[:, 0::2])
+        self.pe[:, 1::2] = np.cos(self.pe[:, 1::2])
+        self.dropout = nn.Dropout(dropout, inplace=True)
+
+    def forward(self, x):
+        out = x + nn.Parameter(self.pe, requires_grad=False).to(self.device)
+        out = self.dropout(out)
+        return out
+
+
+class Scaled_Dot_Product_Attention(nn.Module):
+    '''Scaled Dot-Product Attention '''
+    def __init__(self):
+        super(Scaled_Dot_Product_Attention, self).__init__()
+
+    def forward(self, Q, K, V, scale=None):
+        '''
+        Args:
+            Q: [batch_size, len_Q, dim_Q]
+            K: [batch_size, len_K, dim_K]
+            V: [batch_size, len_V, dim_V]
+            scale: 缩放因子 论文为根号dim_K
+        Return:
+            self-attention后的张量，以及attention张量
+        '''
+        attention = torch.matmul(Q, K.permute(0, 2, 1))
+        if scale:
+            attention = attention * scale
+        # if mask:  # TODO change this
+        #     attention = attention.masked_fill_(mask == 0, -1e9)
+        attention = F.softmax(attention, dim=-1)
+        context = torch.matmul(attention, V)
+        return context
+
+
+class Multi_Head_Attention(nn.Module):
+    def __init__(self, dim_model, num_head, dropout=0.0):
+        super(Multi_Head_Attention, self).__init__()
+        self.num_head = num_head
+        assert dim_model % num_head == 0
+        self.dim_head = dim_model // self.num_head
+        self.fc_Q = nn.Linear(dim_model, num_head * self.dim_head)
+        self.fc_K = nn.Linear(dim_model, num_head * self.dim_head)
+        self.fc_V = nn.Linear(dim_model, num_head * self.dim_head)
+        self.attention = Scaled_Dot_Product_Attention()
+        self.fc = nn.Linear(num_head * self.dim_head, dim_model)
+        self.dropout = nn.Dropout(dropout, inplace=True)
+        self.layer_norm = nn.LayerNorm(dim_model)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        Q = self.fc_Q(x)
+        K = self.fc_K(x)
+        V = self.fc_V(x)
+        Q = Q.view(batch_size * self.num_head, -1, self.dim_head)
+        K = K.view(batch_size * self.num_head, -1, self.dim_head)
+        V = V.view(batch_size * self.num_head, -1, self.dim_head)
+        # if mask:  # TODO
+        #     mask = mask.repeat(self.num_head, 1, 1)  # TODO change this
+        scale = K.size(-1) ** -0.5  # 缩放因子
+        context = self.attention(Q, K, V, scale)
+
+        context = context.view(batch_size, -1, self.dim_head * self.num_head)
+        out = self.fc(context)
+        out = self.dropout(out)
+        out = out + x  # 残差连接
+        out = self.layer_norm(out)
+        return out
+
+
+class Position_wise_Feed_Forward(nn.Module):
+    def __init__(self, dim_model, hidden, dropout=0.0):
+        super(Position_wise_Feed_Forward, self).__init__()
+        self.fc1 = nn.Linear(dim_model, hidden)
+        self.fc2 = nn.Linear(hidden, dim_model)
+        self.dropout = nn.Dropout(dropout, inplace=True)
+        self.layer_norm = nn.LayerNorm(dim_model)
+
+    def forward(self, x):
+        out = self.fc1(x)
+        out = F.relu(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        out = out + x  # 残差连接
+        out = self.layer_norm(out)
+        return out
+
+class Transformer(TorchBase):
+    def __init__(self, O_CONFIG):
+        super().__init__(O_CONFIG)
+
+        self._s_model_name = "transformer"
+        
+        self._net = TransformerNet(O_CONFIG)
+        self._optimizer = torch.optim.Adam(self._net.parameters(), lr=O_CONFIG["learn_rate"])
+        
+        self._s_model_with_weight_path = os.path.join(self.save_dir, "%s_model_with_weight.pth" % (self._s_model_name))
+        self._s_best_model_with_weight_path = os.path.join(self.save_dir, "%s_best_model_with_weight.pth" % (self._s_model_name))
+        self._s_weight_file = os.path.join(self.save_dir, "%s_weight.pth" % (self._s_model_name))
+
+        self.model_path = self._s_best_model_with_weight_path
+    
+
+    
+

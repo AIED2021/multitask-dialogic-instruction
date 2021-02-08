@@ -1,0 +1,17 @@
+*.json
+*.ckpt*
+checkpoint
+vocab.txt
+*.index
+*.meta
+*.pyc
+*.zip
+atc/data/
+datas/test_data_bak/
+tmp/
+examples/*.log
+examples/*.txt
+nohup.out
+nezha_torch/
+tmp2/
+*.log
